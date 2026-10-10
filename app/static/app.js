@@ -23,13 +23,27 @@ $('clear').onclick = async () => {
   try { await api('/api/settings', {method: 'DELETE'}); showSettings(await api('/api/settings')); } catch(e) { error(e); }
 };
 function sceneList() { return [...new Set($('scenes').value.split('\n').map(s => s.trim()).filter(Boolean))]; }
-function budget() {
-  const sections = sceneList().length || 1;
-  $('count-value').textContent = $('count').value;
-  $('candidate-budget').textContent = `${sections} раздел(ов) × ${$('count').value} = до ${sections * Number($('count').value)} кандидатов. AI оплачивается за уникальные проверенные изображения.`;
+function scriptInfo() {
+  const text = $('script').value.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  const wpm = Number($('words-per-minute').value) || 140;
+  const perFrame = Math.max(1, Math.round(wpm * Number($('frame-seconds').value) / 60));
+  return {active: words > 0, frames: Math.ceil(words / perFrame), seconds: Math.round(words * 60 / wpm)};
 }
-$('count').oninput = budget;
-$('scenes').oninput = budget;
+function budget() {
+  const info = scriptInfo();
+  $('count-value').textContent = $('count').value;
+  $('scenes').disabled = info.active;
+  $('example-scenes').disabled = info.active;
+  $('count').disabled = info.active;
+  if (info.active) {
+    $('candidate-budget').textContent = `Примерно ${info.seconds} секунд · ${info.frames} кадров × ${$('script-candidates').value} = до ${info.frames * Number($('script-candidates').value)} кандидатов. Планирование и AI-проверки оплачиваются отдельно.`;
+  } else {
+    const sections = sceneList().length || 1;
+    $('candidate-budget').textContent = `${sections} раздел(ов) × ${$('count').value} = до ${sections * Number($('count').value)} кандидатов. Без видимых водяных знаков; AI может ошибаться.`;
+  }
+}
+for (const id of ['count', 'scenes', 'script', 'frame-seconds', 'words-per-minute', 'script-candidates']) $(id).oninput = budget;
 $('example-scenes').onclick = () => { $('scenes').value = $('scenes').placeholder; budget(); };
 budget();
 $('score').oninput = () => $('score-value').textContent = `${$('score').value} / 10`;
@@ -45,13 +59,15 @@ function render(job) {
     const heading = document.createElement('h3');
     heading.textContent = `${section.name} · ${section.approved} кадров${section.status === 'failed' ? ' · ошибка поиска' : ''}`;
     const grid = document.createElement('div'); grid.className = 'gallery';
-    wrapper.append(heading, grid); $('gallery').append(wrapper);
+    wrapper.append(heading);
+    if (section.text) { const narration = document.createElement('p'); narration.className = 'hint'; narration.textContent = section.text; wrapper.append(narration); }
+    wrapper.append(grid); $('gallery').append(wrapper);
     sectionGrids.set(section.name, grid);
   }
   for (const item of job.images) {
     const card = document.createElement('article'); card.className = 'card';
     const img = document.createElement('img'); img.src = item.url; img.alt = item.reason; img.loading = 'lazy';
-    const text = document.createElement('p'); text.textContent = `${item.score}/10 · ${item.reason}`;
+    const text = document.createElement('p'); text.textContent = `${item.selected ? "★ Основной кадр · " : ""}${item.score}/10 · ${item.reason}`;
     const link = document.createElement('a'); link.href = item.source; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Original source ↗';
     card.append(img, text, link); (sectionGrids.get(item.section) || $('gallery')).append(card);
   }
@@ -67,8 +83,11 @@ async function poll(id) {
 $('workflow').onsubmit = async event => {
   event.preventDefault(); $('message').textContent = ''; $('start').disabled = true; clearTimeout(timer);
   try {
-    if (sceneList().length > 20 || Math.max(1, sceneList().length) * Number($('count').value) > 1000) throw new Error('Уменьши число разделов или кандидатов: максимум 20 разделов и 1000 кандидатов.');
-    const job = await api('/api/jobs', {method:'POST', body:JSON.stringify({query:$('query').value, location:$('location').value, event_date:$('event-date').value, scenes:sceneList(), maximum:Number($('count').value), threshold:Number($('score').value)})});
+    const info = scriptInfo();
+    if (!$('query').value.trim() && !info.active) throw new Error('Введи тему или текст сценария.');
+    if (info.active && (info.frames > 60 || info.frames * Number($('script-candidates').value) > 1000)) throw new Error('Максимум 60 кадров и 1000 кандидатов: сократи текст или уменьши число кандидатов.');
+    if (!info.active && (sceneList().length > 20 || Math.max(1, sceneList().length) * Number($('count').value) > 1000)) throw new Error('Уменьши число разделов или кандидатов: максимум 20 разделов и 1000 кандидатов.');
+    const job = await api('/api/jobs', {method:'POST', body:JSON.stringify({query:$('query').value, location:$('location').value, event_date:$('event-date').value, scenes:info.active ? [] : sceneList(), script:$('script').value, frame_seconds:Number($('frame-seconds').value), words_per_minute:Number($('words-per-minute').value), script_candidates:Number($('script-candidates').value), maximum:Number($('count').value), threshold:Number($('score').value)})});
     sessionStorage.setItem('job', job.id); poll(job.id);
   } catch (e) { error(e); $('start').disabled = false; }
 };

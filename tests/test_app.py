@@ -59,7 +59,7 @@ def test_workflow_filter_errors_and_zip(client, monkeypatch):
             self.chat = SimpleNamespace(completions=self)
         async def create(self, **kwargs):
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-                content='{"score": %d, "reason": "Test judgment"}' % next(scores)))])
+                content='{"score": %d, "reason": "Test judgment", "matches_scene": true, "watermark_status": "clear"}' % next(scores)))])
         async def close(self):
             pass
     monkeypatch.setattr(m, 'search_urls', search)
@@ -167,7 +167,7 @@ def test_storyboard_sections_dedup_partial_failure_and_zip(client, monkeypatch):
         async def create(self, **kwargs):
             prompts.append(kwargs['messages'])
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=
-                m.json.dumps({'score':10, 'reason':'scene judgment', 'matches_scene':next(decisions)})))])
+                m.json.dumps({'score':10, 'reason':'scene judgment', 'matches_scene':next(decisions), 'watermark_status':'clear'})))])
         async def close(self):
             pass
     monkeypatch.setattr(m, 'search_urls', search)
@@ -205,3 +205,115 @@ def test_scene_input_limits_and_form(client):
     page = client.get('/').text
     for field in ['scenes', 'location', 'event-date', 'candidate-budget']:
         assert f'id="{field}"' in page
+
+
+def test_script_segmentation_coverage_and_limits():
+    text = ' '.join(f'word{i}' for i in range(45))
+    body = m.SearchInput(script=text, frame_seconds=10, words_per_minute=120)
+    segments = m.script_segments(body)
+    assert [s['start_seconds'] for s in segments] == [0, 10, 20]
+    assert segments[-1]['end_seconds'] == 22.5
+    assert ' '.join(s['text'] for s in segments) == text
+    with pytest.raises(ValueError):
+        m.SearchInput(script=text, frame_seconds=12)
+    with pytest.raises(ValueError):
+        m.SearchInput(script=text, scenes=['manual'])
+    with pytest.raises(ValueError):
+        m.SearchInput(script='word ' * 1300, frame_seconds=10, words_per_minute=120)
+    assert 'id="script"' in TestClient(m.app).get('/').text
+
+
+def test_script_pipeline_timing_selection_and_watermark_rejection(client, monkeypatch):
+    async def search(_, settings, query, maximum):
+        assert maximum == 3
+        return (['https://example.org/red','https://example.org/blue'] if 'query1' in query else
+                ['https://example.org/blue','https://example.org/green','https://example.org/yellow'])
+    async def fetch(_, url):
+        return jpeg_fixture(url.rsplit('/', 1)[1])
+    states = iter(['present', 'clear', 'uncertain', 'clear'])
+    image_requests = []
+    class FakeAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=self)
+        async def create(self, **kwargs):
+            if isinstance(kwargs['messages'][1]['content'], str):
+                data = m.json.loads(kwargs['messages'][1]['content'])
+                # Deliberately reversed: backend must preserve narration order by id.
+                payload = {'frames':[{'id':s['id'], 'scene':f"scene{s['id']}",
+                    'query':f"query{s['id']}"} for s in reversed(data['intervals'])]}
+            else:
+                image_requests.append(kwargs)
+                payload = {'score':10,'reason':'visual check','matches_scene':True,
+                           'watermark_status':next(states)}
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=m.json.dumps(payload)))])
+        async def close(self):
+            pass
+    monkeypatch.setattr(m, 'search_urls', search)
+    monkeypatch.setattr(m, 'fetch_image', fetch)
+    monkeypatch.setattr(m, 'AsyncOpenAI', FakeAI)
+    job_id = 'script-job'
+    m.jobs[job_id] = {'status':'running','logs':[],'images':[], 'processed':0,
+                      'total':0,'errors':0,'zip_url':None}
+    body = m.SearchInput(script='word ' * 40, frame_seconds=10, words_per_minute=120, script_candidates=3)
+    asyncio.run(m.workflow(job_id, body, {'openai_key':'test','provider':'duckduckgo'}))
+    job = m.jobs[job_id]
+    assert job['status'] == 'completed' and job['errors'] == 0
+    assert job['duplicates'] == 1 and job['watermarks'] == 2
+    assert len(job['images']) == 2 and all(i['selected'] for i in job['images'])
+    assert all(r['messages'][1]['content'][1]['image_url']['detail'] == 'high' for r in image_requests)
+    assert [s['start_seconds'] for s in job['timeline']] == [0,10]
+    assert [s['end_seconds'] for s in job['timeline']] == [10,20]
+    assert all(s['selected_image'] for s in job['timeline'])
+    with zipfile.ZipFile(io.BytesIO(client.get(job['zip_url']).content)) as archive:
+        timeline = m.json.loads(archive.read('timeline.json'))
+        assert len(timeline) == 2
+        assert all(s['selected_image'] in archive.namelist() for s in timeline)
+        assert all(i['watermark_status'] == 'clear' for i in m.json.loads(archive.read('manifest.json')))
+
+
+def test_incomplete_script_plan_fails_before_search(client, monkeypatch):
+    class FakeAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=self)
+        async def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"frames":[]}'))])
+        async def close(self):
+            pass
+    async def no_search(*args):
+        pytest.fail('Search must not start with an incomplete script plan')
+    monkeypatch.setattr(m, 'AsyncOpenAI', FakeAI)
+    monkeypatch.setattr(m, 'search_urls', no_search)
+    m.jobs['invalid-plan'] = {'status':'running','logs':[],'images':[], 'processed':0,
+                             'total':0,'errors':0,'zip_url':None}
+    asyncio.run(m.workflow('invalid-plan', m.SearchInput(script='short narration'),
+                          {'openai_key':'test','provider':'duckduckgo'}))
+    job = m.jobs['invalid-plan']
+    assert job['status'] == 'failed'
+    assert 'Script planning failed' in job['logs'][-1]
+    assert 'DuckDuckGo search unavailable' not in job['logs'][-1]
+
+
+def test_local_updater_preserves_keys_and_backs_up(tmp_path):
+    from update_local import FILES, apply_update
+    for name in FILES:
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('old file')
+    keys = tmp_path / '.local/settings.json'
+    keys.parent.mkdir()
+    keys.write_text('{"openai_key":"test-local-secret"}')
+    raw = io.BytesIO()
+    with zipfile.ZipFile(raw, 'w') as archive:
+        for name in FILES:
+            archive.writestr('newusachannel-main/' + name, 'VALUE = 1\n' if name.endswith('.py') else 'new file')
+    backup = apply_update(tmp_path, raw.getvalue())
+    assert (backup / 'app/main.py').read_text() == 'old file'
+    assert (tmp_path / 'app/main.py').read_text() == 'VALUE = 1\n'
+    assert keys.read_text() == '{"openai_key":"test-local-secret"}'
+    invalid = io.BytesIO()
+    with zipfile.ZipFile(invalid, 'w') as archive:
+        for name in FILES:
+            archive.writestr('newusachannel-main/' + name, 'invalid Python !!!' if name.endswith('.py') else 'bad')
+    with pytest.raises(SyntaxError):
+        apply_update(tmp_path, invalid.getvalue())
+    assert (tmp_path / 'app/main.py').read_text() == 'VALUE = 1\n'
