@@ -47,11 +47,12 @@ def test_image_validation():
 
 def test_workflow_filter_errors_and_zip(client, monkeypatch):
     async def search(*args):
-        return ['https://example.org/good', 'https://example.org/low', 'https://example.org/broken']
+        assert args[3] == 100
+        return ['https://example.org/good', 'https://example.org/copy', 'https://example.org/low', 'https://example.org/broken']
     async def fetch(_, url):
         if url.endswith('broken'):
             raise TimeoutError()
-        return b'pixels'
+        return jpeg_fixture('blue' if url.endswith('low') else 'red')
     scores = iter([9, 3])
     class FakeAI:
         def __init__(self, **kwargs):
@@ -69,8 +70,9 @@ def test_workflow_filter_errors_and_zip(client, monkeypatch):
     asyncio.run(m.workflow(job_id, m.SearchInput(query='history'), {'openai_key':'test', 'provider':'duckduckgo'}))
     job = m.jobs[job_id]
     assert job['status'] == 'completed'
-    assert job['processed'] == 3 and job['errors'] == 1
+    assert job['processed'] == 4 and job['errors'] == 1
     assert len(job['images']) == 1
+    assert job['duplicates'] == 1
     response = client.get(job['zip_url'])
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
@@ -110,3 +112,35 @@ def test_duckduckgo_retries_with_longer_timeout(monkeypatch):
     result = asyncio.run(m.search_urls(None, {'provider':'duckduckgo'}, 'history', 10))
     assert len(attempts) == 3
     assert result == ['https://example.org/photo.jpg']
+
+
+def jpeg_fixture(color):
+    raw = io.BytesIO()
+    Image.new('RGB', (80, 60), color).save(raw, 'JPEG')
+    return raw.getvalue()
+
+
+def test_exact_and_resized_visual_duplicates():
+    from PIL import ImageDraw
+    image = Image.new('RGB', (320, 240), '#213a56')
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((30, 40, 180, 180), fill='#ddddaa')
+    draw.ellipse((120, 50, 280, 220), fill='#32aa88')
+    def encode(im, quality):
+        raw = io.BytesIO()
+        im.save(raw, 'JPEG', quality=quality)
+        return raw.getvalue()
+    original = encode(image, 95)
+    detector = m.ImageDeduplicator()
+    assert not detector.is_duplicate(original)
+    assert detector.is_duplicate(original)
+    assert detector.is_duplicate(encode(image.resize((160, 120)), 75))
+    assert not detector.is_duplicate(jpeg_fixture('red'))
+    assert not detector.is_duplicate(jpeg_fixture('blue'))
+
+
+def test_default_count_and_gallery_form(client):
+    assert m.SearchInput(query='park').maximum == 100
+    page = client.get('/').text
+    assert 'id="count-value">100' in page
+    assert 'max="200" value="100"' in page

@@ -1,6 +1,7 @@
 """Local image research tool. Run bound to 127.0.0.1, not a public interface."""
 import asyncio
 import base64
+import hashlib
 import io
 import ipaddress
 import json
@@ -57,7 +58,7 @@ class SettingsInput(BaseModel):
 
 class SearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=500)
-    maximum: int = Field(default=30, ge=10, le=200)
+    maximum: int = Field(default=100, ge=10, le=200)
     threshold: int = Field(default=7, ge=0, le=10)
 
 
@@ -139,6 +140,39 @@ def normalize_image(content):
         return result.getvalue()
 
 
+class ImageDeduplicator:
+    """Per-workflow exact and conservative visual duplicate detection, without API calls."""
+
+    def __init__(self):
+        self.exact = set()
+        self.visual = []
+
+    def is_duplicate(self, content):
+        digest = hashlib.sha256(content).digest()
+        if digest in self.exact:
+            return True
+        with Image.open(io.BytesIO(content)) as image:
+            aspect = image.width / image.height
+            # A 256-bit difference hash tolerates rescaling and JPEG recompression.
+            gray = image.convert('L').resize((17, 16), Image.Resampling.LANCZOS).tobytes()
+            bits = 0
+            for y in range(16):
+                for x in range(16):
+                    bits = (bits << 1) | (gray[y * 17 + x] > gray[y * 17 + x + 1])
+            colors = image.convert('RGB').resize((16, 16), Image.Resampling.LANCZOS).tobytes()
+        for old_bits, old_colors, old_aspect in self.visual:
+            if abs(aspect / old_aspect - 1) > 0.08:
+                continue
+            if (bits ^ old_bits).bit_count() <= 8:
+                difference = sum(abs(a - b) for a, b in zip(colors, old_colors)) / len(colors)
+                if difference <= 12:
+                    self.exact.add(digest)
+                    return True
+        self.exact.add(digest)
+        self.visual.append((bits, colors, aspect))
+        return False
+
+
 async def search_urls(client, s, query, maximum):
     provider = s['provider']
     if provider == 'duckduckgo':
@@ -192,18 +226,25 @@ async def workflow(job_id, body, settings):
     folder = DATA / job_id
     folder.mkdir(mode=0o700)
     ai = AsyncOpenAI(api_key=settings['openai_key'], max_retries=3, timeout=45)
+    deduplicator = ImageDeduplicator()
+    job['duplicates'] = 0
     try:
         async with httpx.AsyncClient(timeout=25, headers={'User-Agent': 'FrameScout/1.0'}) as client:
             log(job, 'Searching for image links…')
             urls = await search_urls(client, settings, body.query, body.maximum)
             job['total'] = len(urls)
-            log(job, f'Found {len(urls)} unique images')
+            log(job, f'Found {len(urls)} unique links; checking image contents for duplicates')
             if settings['provider'] == 'google' and body.maximum > 100:
                 log(job, 'Google Custom Search supports at most 100 results per query')
             for index, url in enumerate(urls, 1):
                 log(job, f'Evaluating image {index}/{len(urls)}')
                 try:
                     content = await fetch_image(client, url)
+                    if await asyncio.to_thread(deduplicator.is_duplicate, content):
+                        job['duplicates'] += 1
+                        job['processed'] = index
+                        log(job, f'Skipped duplicate image {index}; no OpenAI request made')
+                        continue
                     # Send fetched pixels rather than a remote URL so vision evaluates the exact saved image.
                     result = await ai.chat.completions.create(model='gpt-4o-mini', temperature=0,
                         response_format={'type': 'json_object'}, messages=[
@@ -237,7 +278,8 @@ async def workflow(job_id, body, settings):
                     archive.writestr('manifest.json', json.dumps(job['images'], indent=2))
                 job['zip_url'] = f'/api/jobs/{job_id}/download'
             job['status'] = 'completed'
-            log(job, f'Finished: {len(job["images"])} approved, {job["errors"]} errors')
+            log(job, f'Finished: {len(job["images"])} approved, '
+                f'{job["duplicates"]} duplicates skipped, {job["errors"]} errors')
     except Exception as exc:
         job['status'] = 'failed'
         if settings['provider'] == 'duckduckgo' and job['total'] == 0:

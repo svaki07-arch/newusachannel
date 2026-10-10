@@ -63,3 +63,7 @@ python -m pytest -q
 ```
 
 Tests cover settings/key redaction, cross-origin protection, private destination rejection, image decoding, pagination, and a mocked complete pipeline with approval, rejection, failed download, and ZIP contents. Live provider calls require your keys and quota; these tests do not validate live API credentials.
+
+## Image count and duplicate removal
+
+The default search limit is 100 candidate links (adjustable from 10 to 200). Search providers may return fewer results. Before each OpenAI call, the application checks the decoded image content against earlier images in the current workflow: SHA-256 for exact copies and a conservative visual fingerprint for resized/recompressed copies. Aspect ratio and small RGB comparisons reduce false matches. Duplicate skips appear in the log and do not consume OpenAI evaluation requests. Different crops, large overlays, and other heavy edits can evade detection; visually similar images may occasionally be grouped. The approved ZIP can contain fewer than 100 images because of duplicates, failed downloads, or the AI score threshold. This is not a target of 100 approved images and does not automatically refill rejected candidates. No deduplication state is shared across workflows.
