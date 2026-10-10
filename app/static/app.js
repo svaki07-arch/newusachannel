@@ -22,7 +22,16 @@ $('settings').onsubmit = async event => {
 $('clear').onclick = async () => {
   try { await api('/api/settings', {method: 'DELETE'}); showSettings(await api('/api/settings')); } catch(e) { error(e); }
 };
-$('count').oninput = () => $('count-value').textContent = $('count').value;
+function sceneList() { return [...new Set($('scenes').value.split('\n').map(s => s.trim()).filter(Boolean))]; }
+function budget() {
+  const sections = sceneList().length || 1;
+  $('count-value').textContent = $('count').value;
+  $('candidate-budget').textContent = `${sections} раздел(ов) × ${$('count').value} = до ${sections * Number($('count').value)} кандидатов. AI оплачивается за уникальные проверенные изображения.`;
+}
+$('count').oninput = budget;
+$('scenes').oninput = budget;
+$('example-scenes').onclick = () => { $('scenes').value = $('scenes').placeholder; budget(); };
+budget();
 $('score').oninput = () => $('score-value').textContent = `${$('score').value} / 10`;
 function render(job) {
   $('status').textContent = job.status.toUpperCase();
@@ -30,12 +39,21 @@ function render(job) {
   $('progress').max = job.total || 1; $('progress').value = job.processed;
   $('approved').textContent = job.images.length; $('empty').hidden = job.images.length > 0;
   $('gallery').replaceChildren();
+  const sectionGrids = new Map();
+  for (const section of (job.sections || [])) {
+    const wrapper = document.createElement('section'); wrapper.className = 'section-gallery';
+    const heading = document.createElement('h3');
+    heading.textContent = `${section.name} · ${section.approved} кадров${section.status === 'failed' ? ' · ошибка поиска' : ''}`;
+    const grid = document.createElement('div'); grid.className = 'gallery';
+    wrapper.append(heading, grid); $('gallery').append(wrapper);
+    sectionGrids.set(section.name, grid);
+  }
   for (const item of job.images) {
     const card = document.createElement('article'); card.className = 'card';
     const img = document.createElement('img'); img.src = item.url; img.alt = item.reason; img.loading = 'lazy';
     const text = document.createElement('p'); text.textContent = `${item.score}/10 · ${item.reason}`;
     const link = document.createElement('a'); link.href = item.source; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Original source ↗';
-    card.append(img, text, link); $('gallery').append(card);
+    card.append(img, text, link); (sectionGrids.get(item.section) || $('gallery')).append(card);
   }
   $('zip').hidden = !job.zip_url; if (job.zip_url) $('zip').href = job.zip_url;
 }
@@ -49,7 +67,8 @@ async function poll(id) {
 $('workflow').onsubmit = async event => {
   event.preventDefault(); $('message').textContent = ''; $('start').disabled = true; clearTimeout(timer);
   try {
-    const job = await api('/api/jobs', {method:'POST', body:JSON.stringify({query:$('query').value, maximum:Number($('count').value), threshold:Number($('score').value)})});
+    if (sceneList().length > 20 || Math.max(1, sceneList().length) * Number($('count').value) > 1000) throw new Error('Уменьши число разделов или кандидатов: максимум 20 разделов и 1000 кандидатов.');
+    const job = await api('/api/jobs', {method:'POST', body:JSON.stringify({query:$('query').value, location:$('location').value, event_date:$('event-date').value, scenes:sceneList(), maximum:Number($('count').value), threshold:Number($('score').value)})});
     sessionStorage.setItem('job', job.id); poll(job.id);
   } catch (e) { error(e); $('start').disabled = false; }
 };

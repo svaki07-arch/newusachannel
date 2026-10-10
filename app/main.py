@@ -6,6 +6,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import time
 import uuid
@@ -19,7 +20,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,8 +59,20 @@ class SettingsInput(BaseModel):
 
 class SearchInput(BaseModel):
     query: str = Field(min_length=1, max_length=500)
+    location: str = Field(default='', max_length=200)
+    event_date: str = Field(default='', max_length=200)
+    scenes: list[str] = Field(default_factory=list, max_length=20)
     maximum: int = Field(default=100, ge=10, le=200)
     threshold: int = Field(default=7, ge=0, le=10)
+
+    @model_validator(mode='after')
+    def validate_scenes(self):
+        self.scenes = list(dict.fromkeys(s.strip() for s in self.scenes if s.strip()))
+        if any(len(scene) > 500 for scene in self.scenes):
+            raise ValueError('Each scene must be at most 500 characters')
+        if max(1, len(self.scenes)) * self.maximum > 1000:
+            raise ValueError('Maximum 1000 candidates per workflow; reduce scenes or images per scene')
+        return self
 
 
 def read_settings():
@@ -231,13 +244,40 @@ async def workflow(job_id, body, settings):
     try:
         async with httpx.AsyncClient(timeout=25, headers={'User-Agent': 'FrameScout/1.0'}) as client:
             log(job, 'Searching for image links…')
-            urls = await search_urls(client, settings, body.query, body.maximum)
+            candidates = []
+            seen_urls = set()
+            sections = body.scenes or ['General']
+            job['sections'] = []
+            for number, scene in enumerate(sections, 1):
+                query = ' '.join(p.strip() for p in [body.query, body.location, body.event_date,
+                                                     scene if body.scenes else ''] if p.strip())
+                section = {'name': scene, 'query': query, 'found': 0, 'approved': 0,
+                           'status': 'searched', 'folder': f'{number:02d}_' +
+                           (re.sub(r'[^\w-]+', '_', scene).strip('_')[:60] or 'scene')}
+                job['sections'].append(section)
+                log(job, f'Searching section {number}/{len(sections)}: {scene}')
+                try:
+                    found = await search_urls(client, settings, query, body.maximum)
+                    section['found'] = len(found)
+                    for url in found:
+                        if url in seen_urls:
+                            job['duplicates'] += 1
+                            continue
+                        seen_urls.add(url)
+                        candidates.append((url, section))
+                except Exception as exc:
+                    section['status'] = 'failed'
+                    job['errors'] += 1
+                    log(job, f'Section search failed ({type(exc).__name__}): {scene}; continuing')
+            if all(s['status'] == 'failed' for s in job['sections']):
+                raise ValueError('All section searches failed')
+            urls = candidates
             job['total'] = len(urls)
             log(job, f'Found {len(urls)} unique links; checking image contents for duplicates')
             if settings['provider'] == 'google' and body.maximum > 100:
                 log(job, 'Google Custom Search supports at most 100 results per query')
-            for index, url in enumerate(urls, 1):
-                log(job, f'Evaluating image {index}/{len(urls)}')
+            for index, (url, section) in enumerate(urls, 1):
+                log(job, f'Evaluating image {index}/{len(urls)} — {section["name"]}')
                 try:
                     content = await fetch_image(client, url)
                     if await asyncio.to_thread(deduplicator.is_duplicate, content):
@@ -248,23 +288,37 @@ async def workflow(job_id, body, settings):
                     # Send fetched pixels rather than a remote URL so vision evaluates the exact saved image.
                     result = await ai.chat.completions.create(model='gpt-4o-mini', temperature=0,
                         response_format={'type': 'json_object'}, messages=[
-                            {'role': 'system', 'content': PROMPT},
+                            {'role': 'system', 'content': PROMPT + ("\nAlso return matches_scene: boolean. "
+                             "Evaluate relevance to the requested scene and topic. Maps, forecast charts, "
+                             "and document scans are valid when requested; their informative text is "
+                             "content, not clickbait. Set matches_scene=false for unrelated visuals. "
+                             "Location/date are search context, not facts you can verify from pixels. "
+                             "Do not assert that the event's place, date, or document authenticity is verified."
+                             if body.scenes else '')},
                             {'role': 'user', 'content': [
-                                {'type': 'text', 'text': f'Relevance query: {body.query}'},
+                                {'type': 'text', 'text': json.dumps({'topic': body.query,
+                                    'location': body.location, 'date': body.event_date,
+                                    'scene': section['name']}, ensure_ascii=False)},
                                 {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + base64.b64encode(content).decode(), 'detail': 'low'}}]}])
                     decision = json.loads(result.choices[0].message.content)
                     score = decision.get('score')
                     reason = decision.get('reason')
+                    matches_scene = decision.get('matches_scene', True) if not body.scenes else decision.get('matches_scene')
                     if type(score) is not int or not 0 <= score <= 10 or not isinstance(reason, str):
                         raise ValueError('Invalid vision JSON')
-                    if score >= body.threshold:
+                    if type(matches_scene) is not bool:
+                        raise ValueError('Invalid scene judgment')
+                    if score >= body.threshold and matches_scene:
                         filename = f'image_{index:03d}.jpg'
                         (folder / filename).write_bytes(content)
                         job['images'].append({'filename': filename, 'score': score, 'reason': reason[:1000],
-                                              'source': url, 'url': f'/api/jobs/{job_id}/images/{filename}'})
+                                              'source': url, 'section': section['name'],
+                                              'archive_path': f'{section["folder"]}/{filename}' if body.scenes else filename,
+                                              'url': f'/api/jobs/{job_id}/images/{filename}'})
+                        section['approved'] += 1
                         log(job, f'Approved and saved image {index}: {score}/10')
                     else:
-                        log(job, f'Rejected image {index}: {score}/10')
+                        log(job, f'Rejected image {index}: {score}/10 — {reason[:300]}')
                 except Exception as exc:
                     # Avoid logging exception strings: SDK and HTTP errors may contain credentials.
                     job['errors'] += 1
@@ -274,8 +328,10 @@ async def workflow(job_id, body, settings):
             if job['images']:
                 with zipfile.ZipFile(folder / 'curated.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                     for image in job['images']:
-                        archive.write(folder / image['filename'], image['filename'])
+                        archive.write(folder / image['filename'], image['archive_path'])
                     archive.writestr('manifest.json', json.dumps(job['images'], indent=2))
+                    if body.scenes:
+                        archive.writestr('sections.json', json.dumps(job['sections'], ensure_ascii=False, indent=2))
                 job['zip_url'] = f'/api/jobs/{job_id}/download'
             job['status'] = 'completed'
             log(job, f'Finished: {len(job["images"])} approved, '

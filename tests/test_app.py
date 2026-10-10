@@ -144,3 +144,64 @@ def test_default_count_and_gallery_form(client):
     page = client.get('/').text
     assert 'id="count-value">100' in page
     assert 'max="200" value="100"' in page
+
+
+def test_storyboard_sections_dedup_partial_failure_and_zip(client, monkeypatch):
+    searches = []
+    async def search(http, settings, query, maximum):
+        searches.append(query)
+        assert maximum == 10
+        if query.endswith('reports'):
+            raise TimeoutError()
+        if query.endswith('onset'):
+            return ['https://example.org/red']
+        return ['https://example.org/red', 'https://example.org/red-copy',
+                'https://example.org/blue', 'https://example.org/green']
+    async def fetch(_, url):
+        return jpeg_fixture('red' if 'red' in url else url.rsplit('/', 1)[1])
+    decisions = iter([True, False, True])
+    prompts = []
+    class FakeAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=self)
+        async def create(self, **kwargs):
+            prompts.append(kwargs['messages'])
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=
+                m.json.dumps({'score':10, 'reason':'scene judgment', 'matches_scene':next(decisions)})))])
+        async def close(self):
+            pass
+    monkeypatch.setattr(m, 'search_urls', search)
+    monkeypatch.setattr(m, 'fetch_image', fetch)
+    monkeypatch.setattr(m, 'AsyncOpenAI', FakeAI)
+    job_id = 'storyboard'
+    m.jobs[job_id] = {'status':'running','logs':[],'images':[], 'processed':0,
+                      'total':0,'errors':0,'zip_url':None}
+    body = m.SearchInput(query='hurricane', location='Florida', event_date='2024',
+                         scenes=['onset','aftermath','reports'], maximum=10)
+    asyncio.run(m.workflow(job_id, body, {'openai_key':'test','provider':'duckduckgo'}))
+    job = m.jobs[job_id]
+    assert searches == ['hurricane Florida 2024 onset', 'hurricane Florida 2024 aftermath',
+                        'hurricane Florida 2024 reports']
+    assert job['status'] == 'completed' and job['errors'] == 1
+    assert job['duplicates'] == 2
+    assert len(prompts) == 3  # URL/content duplicates make no AI call.
+    assert len(job['images']) == 2  # A score of 10 cannot override a scene mismatch.
+    assert [i['section'] for i in job['images']] == ['onset','aftermath']
+    assert job['sections'][2]['status'] == 'failed'
+    assert 'matches_scene' in prompts[0][0]['content']
+    with zipfile.ZipFile(io.BytesIO(client.get(job['zip_url']).content)) as archive:
+        assert '01_onset/image_001.jpg' in archive.namelist()
+        assert '02_aftermath/image_004.jpg' in archive.namelist()
+        assert 'sections.json' in archive.namelist()
+    assert client.get(job['images'][0]['url']).status_code == 200
+
+
+def test_scene_input_limits_and_form(client):
+    assert m.SearchInput(query='storm', scenes=[' onset ', '', 'onset']).scenes == ['onset']
+    with pytest.raises(ValueError):
+        m.SearchInput(query='storm', scenes=['x' * 501])
+    with pytest.raises(ValueError):
+        m.SearchInput(query='storm', scenes=[str(i) for i in range(11)], maximum=100)
+    page = client.get('/').text
+    for field in ['scenes', 'location', 'event-date', 'candidate-budget']:
+        assert f'id="{field}"' in page
