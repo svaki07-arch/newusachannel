@@ -47,23 +47,18 @@ def test_image_validation():
 
 def test_workflow_filter_errors_and_zip(client, monkeypatch):
     async def search(*args):
-        assert args[2] == 'park winter'
-        return ['https://example.org/good', 'https://example.org/low', 'https://example.org/mismatch', 'https://example.org/broken']
+        return ['https://example.org/good', 'https://example.org/low', 'https://example.org/broken']
     async def fetch(_, url):
         if url.endswith('broken'):
             raise TimeoutError()
         return b'pixels'
-    decisions = iter([(9, True), (3, True), (10, False)])
+    scores = iter([9, 3])
     class FakeAI:
         def __init__(self, **kwargs):
             self.chat = SimpleNamespace(completions=self)
         async def create(self, **kwargs):
-            prompt = kwargs['messages'][0]['content']
-            assert 'no people' in prompt and 'winter' in prompt
-            assert '"reject_visible_watermarks": true' in prompt
-            score, matches = next(decisions)
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-                content=m.json.dumps({'score': score, 'reason': 'Test judgment', 'meets_criteria': matches})))])
+                content='{"score": %d, "reason": "Test judgment"}' % next(scores)))])
         async def close(self):
             pass
     monkeypatch.setattr(m, 'search_urls', search)
@@ -71,10 +66,10 @@ def test_workflow_filter_errors_and_zip(client, monkeypatch):
     monkeypatch.setattr(m, 'AsyncOpenAI', FakeAI)
     job_id = 'testjob'
     m.jobs[job_id] = {'status':'running', 'logs':[], 'images':[], 'processed':0, 'total':0, 'errors':0, 'zip_url':None}
-    asyncio.run(m.workflow(job_id, m.SearchInput(query='park', refinement='winter', criteria='no people'), {'openai_key':'test', 'provider':'duckduckgo'}))
+    asyncio.run(m.workflow(job_id, m.SearchInput(query='history'), {'openai_key':'test', 'provider':'duckduckgo'}))
     job = m.jobs[job_id]
     assert job['status'] == 'completed'
-    assert job['processed'] == 4 and job['errors'] == 1
+    assert job['processed'] == 3 and job['errors'] == 1
     assert len(job['images']) == 1
     response = client.get(job['zip_url'])
     assert response.status_code == 200

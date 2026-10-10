@@ -49,7 +49,7 @@ async function poll(id) {
 $('workflow').onsubmit = async event => {
   event.preventDefault(); $('message').textContent = ''; $('start').disabled = true; clearTimeout(timer);
   try {
-    const job = await api('/api/jobs', {method:'POST', body:JSON.stringify({query:$('query').value, refinement:$('refinement').value, criteria:$('criteria').value, no_watermarks:$('no-watermarks').checked, maximum:Number($('count').value), threshold:Number($('score').value)})});
+    const job = await api('/api/jobs', {method:'POST', body:JSON.stringify({query:$('query').value, maximum:Number($('count').value), threshold:Number($('score').value)})});
     sessionStorage.setItem('job', job.id); poll(job.id);
   } catch (e) { error(e); $('start').disabled = false; }
 };

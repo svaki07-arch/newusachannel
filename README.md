@@ -41,7 +41,7 @@ Runtime files are created in ignored `.local/`: `settings.json` and one director
    ```
 6. Open `http://127.0.0.1:8000` on your local machine.
 7. Save your OpenAI API key and select a search provider. Enter its key for SerpApi or Google. Google also requires a Programmable Search engine ID (`cx`) with image search enabled. DuckDuckGo needs no search key but can be throttled or return fewer results.
-8. Enter a topic, optional search details, image requirements, image count, and score threshold, then select **Start Workflow**. Approved frames appear during processing; download the ZIP once processing finishes.
+8. Enter a query, image count, and score threshold, then select **Start Workflow**. Approved frames appear during processing; download the ZIP once processing finishes.
 
 Keys are stored as plaintext on your local disk with restrictive permissions on Unix, never returned through the API, and excluded from Git. Use **Delete saved keys** to remove settings. Restrict access to your OS account and disk; Windows users should check their directory ACLs. Do not expose this app publicly or bind it to a public interface: it has no multiuser authentication. It accepts localhost hostnames and rejects cross-origin state changes.
 
@@ -63,7 +63,3 @@ python -m pytest -q
 ```
 
 Tests cover settings/key redaction, cross-origin protection, private destination rejection, image decoding, pagination, and a mocked complete pipeline with approval, rejection, failed download, and ZIP contents. Live provider calls require your keys and quota; these tests do not validate live API credentials.
-
-## Topic and image requirements
-
-For example, topic `park`, search details `winter snow`, and requirements `no people, wide shot, real photograph`. Topic and search details form the search query. The AI evaluates those details and the separate requirements. The enabled-by-default **No visible watermarks** checkbox adds a mandatory visual check. Images must both meet all requirements and pass the score threshold; a high score cannot override a failed requirement. The gallery and logs explain decisions. Visual judgments can miss subtle watermarks or misidentify seasons; inspect the results yourself. No watermark does not establish a license.
