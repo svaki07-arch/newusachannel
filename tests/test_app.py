@@ -89,3 +89,24 @@ def test_search_pagination(client):
             return await m.search_urls(http, {'provider':'google','search_key':'test','google_cx':'cx'}, 'history', 20)
     assert len(asyncio.run(run())) == 20
     assert len(requests) == 2
+
+
+def test_duckduckgo_retries_with_longer_timeout(monkeypatch):
+    import ddgs
+    from ddgs.exceptions import DDGSException
+    attempts = []
+    class FakeDDGS:
+        def __init__(self, timeout):
+            assert timeout == 30
+        def images(self, query, max_results):
+            attempts.append(query)
+            if len(attempts) < 3:
+                raise DDGSException('Temporary search failure')
+            return [{'image': 'https://example.org/photo.jpg'}]
+    async def no_wait(_):
+        pass
+    monkeypatch.setattr(ddgs, 'DDGS', FakeDDGS)
+    monkeypatch.setattr(m.asyncio, 'sleep', no_wait)
+    result = asyncio.run(m.search_urls(None, {'provider':'duckduckgo'}, 'history', 10))
+    assert len(attempts) == 3
+    assert result == ['https://example.org/photo.jpg']

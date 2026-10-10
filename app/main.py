@@ -143,7 +143,16 @@ async def search_urls(client, s, query, maximum):
     provider = s['provider']
     if provider == 'duckduckgo':
         from ddgs import DDGS
-        rows = await asyncio.to_thread(lambda: list(DDGS().images(query, max_results=maximum)))
+        from ddgs.exceptions import DDGSException
+        for attempt in range(3):
+            try:
+                rows = await asyncio.to_thread(
+                    lambda: list(DDGS(timeout=30).images(query, max_results=maximum)))
+                break
+            except DDGSException:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2 ** (attempt + 1))
         return list(dict.fromkeys(r['image'] for r in rows if r.get('image')))[:maximum]
     urls = []
     # Google Custom Search limits a query to its first 100 results.
@@ -231,7 +240,11 @@ async def workflow(job_id, body, settings):
             log(job, f'Finished: {len(job["images"])} approved, {job["errors"]} errors')
     except Exception as exc:
         job['status'] = 'failed'
-        log(job, f'Workflow failed ({type(exc).__name__}); check search settings, connectivity, and quota')
+        if settings['provider'] == 'duckduckgo' and job['total'] == 0:
+            log(job, 'DuckDuckGo search unavailable after retries. No OpenAI evaluations were made. '
+                'Try again later, check your Internet connection, or select SerpApi/Google with its own search API key.')
+        else:
+            log(job, f'Workflow failed ({type(exc).__name__}); check search settings, connectivity, and quota')
     finally:
         await ai.close()
 
